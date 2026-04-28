@@ -32,7 +32,7 @@ jobs:
           vcpkgGitCommitId: 'b27651341123a59f7187b42ef2bc476284afb310'
 
       - name: Install vcpkg packages
-        run: vcpkg\vcpkg install libusb libpcap libsodium ffmpeg qt5 sdl2 pkgconf
+        run: vcpkg install libusb libpcap libsodium ffmpeg sdl2 pkgconf qt5-base qt5-declarative qt5-multimedia
 
       - name: Build fpv4win
         run: |
