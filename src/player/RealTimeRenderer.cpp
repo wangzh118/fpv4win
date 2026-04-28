@@ -1,5 +1,6 @@
-﻿#include "RealTimeRenderer.h"
+#include "RealTimeRenderer.h"
 #include "libavutil/pixfmt.h"
+#include "libswscale/swscale.h"
 #include <QOpenGLPixelTransferOptions>
 
 #define VSHCODE                                                                                                        \
@@ -78,6 +79,7 @@ static void safeDeleteTexture(QOpenGLTexture *texture) {
 
 RealTimeRenderer::RealTimeRenderer() {
     qWarning() << __FUNCTION__;
+    initShm();
 }
 
 RealTimeRenderer::~RealTimeRenderer() {
@@ -85,6 +87,61 @@ RealTimeRenderer::~RealTimeRenderer() {
     safeDeleteTexture(mTexY);
     safeDeleteTexture(mTexU);
     safeDeleteTexture(mTexV);
+    if (mShmPtr)    UnmapViewOfFile(mShmPtr);
+    if (mShmHandle) CloseHandle(mShmHandle);
+}
+
+void RealTimeRenderer::initShm() {
+    mShmHandle = CreateFileMappingA(
+        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+        0, SHM_SIZE, "FPV4WIN_FRAME"
+    );
+    if (!mShmHandle) {
+        qWarning() << "[shm] CreateFileMapping failed:" << GetLastError();
+        return;
+    }
+    mShmPtr = MapViewOfFile(mShmHandle, FILE_MAP_WRITE, 0, 0, SHM_SIZE);
+    if (!mShmPtr) {
+        qWarning() << "[shm] MapViewOfFile failed:" << GetLastError();
+        CloseHandle(mShmHandle);
+        mShmHandle = nullptr;
+        return;
+    }
+    memset(mShmPtr, 0, SHM_SIZE);
+    qWarning() << "[shm] 共享内存已创建: FPV4WIN_FRAME  size=" << SHM_SIZE;
+}
+
+void RealTimeRenderer::writeFrameToShm(const std::shared_ptr<AVFrame> &data) {
+    if (!mShmPtr) return;
+
+    int w = data->width;
+    int h = data->height;
+    if (w <= 0 || h <= 0 || w > SHM_MAX_W || h > SHM_MAX_H) return;
+
+    // 用 swscale 把 YUV 转成 BGR24
+    SwsContext *sws = sws_getContext(
+        w, h, (AVPixelFormat)data->format,
+        w, h, AV_PIX_FMT_BGR24,
+        SWS_BILINEAR, nullptr, nullptr, nullptr
+    );
+    if (!sws) return;
+
+    uint8_t *dstData[1];
+    int      dstLinesize[1];
+    dstData[0]     = (uint8_t*)mShmPtr + SHM_HEADER;
+    dstLinesize[0] = w * 3;
+
+    sws_scale(sws,
+              (const uint8_t * const*)data->data, data->linesize,
+              0, h,
+              dstData, dstLinesize);
+    sws_freeContext(sws);
+
+    // 写头部
+    int *header = (int*)mShmPtr;
+    header[0] = w;
+    header[1] = h;
+    header[2] = ++mFrameId;  // 单调递增，Python用来判断是否有新帧
 }
 
 void RealTimeRenderer::init() {
@@ -125,21 +182,18 @@ void RealTimeRenderer::initTexture() {
     // yuv420p
     mTexY = new QOpenGLTexture(QOpenGLTexture::Target2D);
     mTexY->setFormat(QOpenGLTexture::LuminanceFormat);
-    //    mTexY->setFixedSamplePositions(false);
     mTexY->setMinificationFilter(QOpenGLTexture::Nearest);
     mTexY->setMagnificationFilter(QOpenGLTexture::Nearest);
     mTexY->setWrapMode(QOpenGLTexture::ClampToEdge);
 
     mTexU = new QOpenGLTexture(QOpenGLTexture::Target2D);
     mTexU->setFormat(mPixFmt == AV_PIX_FMT_NV12?QOpenGLTexture::LuminanceAlphaFormat:QOpenGLTexture::LuminanceFormat);
-    //    mTexU->setFixedSamplePositions(false);
     mTexU->setMinificationFilter(QOpenGLTexture::Nearest);
     mTexU->setMagnificationFilter(QOpenGLTexture::Nearest);
     mTexU->setWrapMode(QOpenGLTexture::ClampToEdge);
 
     mTexV = new QOpenGLTexture(QOpenGLTexture::Target2D);
     mTexV->setFormat(QOpenGLTexture::LuminanceFormat);
-    //    mTexV->setFixedSamplePositions(false);
     mTexV->setMinificationFilter(QOpenGLTexture::Nearest);
     mTexV->setMagnificationFilter(QOpenGLTexture::Nearest);
     mTexV->setWrapMode(QOpenGLTexture::ClampToEdge);
@@ -160,7 +214,6 @@ void RealTimeRenderer::updateTextureInfo(int width, int height, int format) {
         initTexture();
     }
     if (format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P) {
-        // yuv420p
         mTexY->setSize(width, height);
         mTexY->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
 
@@ -176,11 +229,9 @@ void RealTimeRenderer::updateTextureInfo(int width, int height, int format) {
         mTexU->setSize(width / 2, height / 2);
         mTexU->allocateStorage(QOpenGLTexture::LuminanceAlpha, QOpenGLTexture::UInt8);
 
-        // NV12 not use for v
         mTexV->setSize(2, 2);
         mTexV->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
     } else {
-        // 先按yuv444p处理
         mTexY->setSize(width, height);
         mTexY->allocateStorage(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8);
 
@@ -194,6 +245,9 @@ void RealTimeRenderer::updateTextureInfo(int width, int height, int format) {
 }
 
 void RealTimeRenderer::updateTextureData(const std::shared_ptr<AVFrame> &data) {
+    // 写入共享内存（给Python/CV读帧用）
+    writeFrameToShm(data);
+
     double frameWidth = m_itemWidth;
     double frameHeight = m_itemHeight;
     if (m_itemWidth * (1.0 * data->height / data->width) < m_itemHeight) {
@@ -203,7 +257,6 @@ void RealTimeRenderer::updateTextureData(const std::shared_ptr<AVFrame> &data) {
     }
     double x = (m_itemWidth - frameWidth) / 2;
     double y = (m_itemHeight - frameHeight) / 2;
-    // GL顶点坐标转换
     auto x1 = (float)(-1 + 2.0 / m_itemWidth * x);
     auto y1 = (float)(1 - 2.0 / m_itemHeight * y);
     auto x2 = (float)(2.0 / m_itemWidth * frameWidth + x1);
@@ -236,6 +289,7 @@ void RealTimeRenderer::updateTextureData(const std::shared_ptr<AVFrame> &data) {
         mTexV->setData(QOpenGLTexture::Luminance, QOpenGLTexture::UInt8, data->data[2], &options);
     }
 }
+
 void RealTimeRenderer::paint() {
     glDepthMask(true);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -254,32 +308,25 @@ void RealTimeRenderer::paint() {
     mProjectMatHandle = mProgram.uniformLocation("u_projectMatrix");
     mVerticesHandle = mProgram.attributeLocation("qt_Vertex");
     mTexCoordHandle = mProgram.attributeLocation("texCoord");
-    // 顶点
+
     mProgram.enableAttributeArray(mVerticesHandle);
     mProgram.setAttributeArray(mVerticesHandle, mVertices.constData());
 
-    // 纹理坐标
     mProgram.enableAttributeArray(mTexCoordHandle);
     mProgram.setAttributeArray(mTexCoordHandle, mTexcoords.constData());
 
-    // MVP矩阵
     mProgram.setUniformValue(mModelMatHandle, mModelMatrix);
     mProgram.setUniformValue(mViewMatHandle, mViewMatrix);
     mProgram.setUniformValue(mProjectMatHandle, mProjectionMatrix);
 
-    // pixFmt
     mProgram.setUniformValue("pixFmt", mPixFmt);
 
-    // 纹理
-    //  Y
     glActiveTexture(GL_TEXTURE0);
     mTexY->bind();
 
-    // U
     glActiveTexture(GL_TEXTURE1);
     mTexU->bind();
 
-    // V
     glActiveTexture(GL_TEXTURE2);
     mTexV->bind();
 
